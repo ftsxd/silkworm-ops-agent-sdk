@@ -1,4 +1,4 @@
-# silkops-auth
+# silkworm-ops-agent-sdk
 
 平台代用户调用其他服务时使用的身份凭证 SDK：调用方每个请求签一张短期凭证，被调用方验签。
 
@@ -129,7 +129,38 @@ CREATE TABLE silkauth_jti (
 - **吊销平台**：`Disabled: true`，然后调用 `keys.Set(...)` 热更新，不需要重启。
 - **IP 白名单**：按连接的来源地址校验，不读取 `X-Forwarded-For`。部署在反向代理后面时，白名单要填代理的地址，或者在代理层做限制。
 
-## 4. 凭证格式
+## 4. 接收回调（调用方平台）
+
+异步任务结束时，被调用方会 POST 结果到调用方给的 `callback_url`。这时方向反过来：被调用方用**自己的私钥**签名（`iss` 是被调用方的 id，例如 `silkworm-ops`；`aud` 是调用方平台的 id；`sub` 是任务所属的用户），调用方验签。凭证的 `ctx` 里带着 `run_id` 和请求体的 SHA-256，`VerifyCallback` 同时校验凭证和请求体没被改过。
+
+```go
+// 被调用方的公钥和 kid 在它的控制台上能看到（silkworm-ops：管理后台 →「接入平台」页）
+pub, _ := silkauth.ParsePublicKeyPEM(silkopsPubPEM)
+keys, _ := silkauth.NewStaticKeys(silkauth.Platform{
+    ID:   "silkworm-ops",
+    Keys: map[string]crypto.PublicKey{"silkworm-ops-20261111": pub},
+})
+callbacks, _ := silkauth.NewVerifier(silkauth.VerifierConfig{
+    Audience: "myplatform", // 自己的平台 id
+    Keys:     keys,
+})
+
+mux.HandleFunc("POST /silkops/callback", func(w http.ResponseWriter, r *http.Request) {
+    c, body, err := silkauth.VerifyCallback(r.Context(), callbacks, r, 0)
+    if err != nil {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+    }
+    runID := c.Context[silkauth.HintRunID] // 与 body 里的 run_id 一致
+    _ = runID
+    _ = body // JSON 结果，与 GET /runs/{id} 的返回相同
+    w.WriteHeader(http.StatusNoContent) // 2xx 即视为送达，否则按 0s/2s/10s/30s 重试
+})
+```
+
+发送回调的一方用 `silkauth.CallbackHint(runID, body)` 生成要签进 `ctx` 的内容，保证两边按同样的方式计算摘要。
+
+## 5. 凭证格式
 
 ```
 header  { "alg": "EdDSA", "kid": "myplatform-2026", "typ": "JWT" }
@@ -152,4 +183,4 @@ payload {
 go test -race ./...
 ```
 
-覆盖的场景：正常签发与验证、受众错误、过期、签发时间在未来、篡改 `sub`、注入 `roles`、`alg` 为 none / HS256 / 与密钥类型不符、未知的 kid、未知或已吊销的平台、用其他私钥伪造、重放（包括 50 个并发请求只有 1 个成功）、被拒的凭证不占用 jti、有效期上限、RS256 及小于 2048 位的 RSA 密钥、PEM 编解码、Transport 每个请求使用新凭证、中间件端到端、IP 白名单、traceparent 解析与透传。
+覆盖的场景：正常签发与验证、受众错误、过期、签发时间在未来、篡改 `sub`、注入 `roles`、`alg` 为 none / HS256 / 与密钥类型不符、未知的 kid、未知或已吊销的平台、用其他私钥伪造、重放（包括 50 个并发请求只有 1 个成功）、被拒的凭证不占用 jti、有效期上限、RS256 及小于 2048 位的 RSA 密钥、PEM 编解码、Transport 每个请求使用新凭证、中间件端到端、IP 白名单、traceparent 解析与透传、回调的请求体校验（篡改、缺少摘要、超长、受众错误）。

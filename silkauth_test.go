@@ -437,3 +437,46 @@ func resign(t *testing.T, f *fixture, tok string) string {
 	}
 	return input + "." + b64.EncodeToString(sig)
 }
+
+// A callback runs the other way: the service signs, the platform verifies,
+// and the body is bound to the credential by its hash.
+func TestVerifyCallback(t *testing.T) {
+	pub, priv, _ := GenerateEd25519()
+	service, _ := NewSigner(SignerConfig{Issuer: "silkworm-ops", KeyID: "silkworm-ops-20261111", Key: priv})
+	keys, _ := NewStaticKeys(Platform{ID: "silkworm-ops", Keys: map[string]crypto.PublicKey{"silkworm-ops-20261111": pub}})
+	platform, _ := NewVerifier(VerifierConfig{Audience: "kimiops", Keys: keys})
+
+	body := []byte(`{"run_id":"r_1","status":"completed","conclusion":"连接池耗尽"}`)
+	request := func(signedBody, sentBody []byte, hint map[string]string) *http.Request {
+		if hint == nil {
+			hint = CallbackHint("r_1", signedBody)
+		}
+		tok, err := service.Sign("zhangsan", "kimiops", WithHint(hint))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, "/silkops/callback", strings.NewReader(string(sentBody)))
+		r.Header.Set("Authorization", "Bearer "+tok)
+		return r
+	}
+
+	c, got, err := VerifyCallback(context.Background(), platform, request(body, body, nil), 0)
+	if err != nil || string(got) != string(body) || c.Subject != "zhangsan" || c.Context[HintRunID] != "r_1" {
+		t.Fatalf("good callback: %v %q %+v", err, got, c)
+	}
+	tampered := []byte(strings.Replace(string(body), "completed", "failed", 1))
+	if _, _, err := VerifyCallback(context.Background(), platform, request(body, tampered, nil), 0); !errors.Is(err, ErrBodyMismatch) {
+		t.Fatalf("tampered body: %v", err)
+	}
+	if _, _, err := VerifyCallback(context.Background(), platform, request(body, body, map[string]string{HintRunID: "r_1"}), 0); !errors.Is(err, ErrBodyMismatch) {
+		t.Fatalf("no body hash: %v", err)
+	}
+	if _, _, err := VerifyCallback(context.Background(), platform, request(body, body, nil), 10); err == nil {
+		t.Fatal("over the size limit")
+	}
+	// A credential for someone else is still refused.
+	other, _ := NewVerifier(VerifierConfig{Audience: "devportal", Keys: keys})
+	if _, _, err := VerifyCallback(context.Background(), other, request(body, body, nil), 0); !errors.Is(err, ErrAudience) {
+		t.Fatalf("wrong audience: %v", err)
+	}
+}
